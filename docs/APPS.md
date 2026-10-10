@@ -28,6 +28,7 @@ rename the folder, and edit `manifest.json`.
 | `entry`       | optional, default `index.html`; path inside the folder |
 | `icon`        | optional; png, jpg, gif, webp or svg inside the folder |
 | `permissions` | optional list; unknown names make the app fail to load |
+| `devUrl`      | optional; `http://localhost:<port>` of your dev server. Only used in Developer mode (below) |
 
 A broken manifest shows a toast naming the folder and the problem.
 
@@ -69,9 +70,31 @@ Paths with `..`, `\`, `:` or other special characters are rejected. Apps can't s
 
 Ask for as little as you need.
 
+## Developer mode
+
+Settings → **Developer mode**. While it's on, an open app gets a **↻** button and a **Console** panel
+(`console.log/info/warn/error`, uncaught errors and unhandled promise rejections; a badge counts errors
+while the panel is closed). Two ways to get live reload:
+
+1. **Watch the folder.** The phone checks the app's folder every second and reloads when any file
+   changes (manifest changes included). Nothing else to run.
+2. **Use your own dev server.** Put `"devUrl": "http://localhost:5173"` in `manifest.json`. The phone loads
+   your server inside the app frame, so Vite/esbuild/anything with hot reload works, including ES modules.
+   Your page must include the SDK itself: copy `src/sdk/phone-sdk.js` next to it and add
+   `<script src="phone-sdk.js"></script>`. If the phone doesn't hear from the SDK within 4 seconds the console says so.
+
+`templates/dev-app/` has both: copy it into `Apps/`, run `node serve.mjs` in it (a zero-dependency server
+that live-reloads on save), and open it.
+
+Dev-server mode is **not** network-sandboxed (your dev server needs the network, and hot reload uses it).
+It runs on its own origin, so it still can't touch the phone itself, and the `phone` API is permission-checked
+exactly the same. With Developer mode off, `devUrl` is ignored and the folder's files run in the normal
+sandbox, which is how your users will run the app, so test that before you ship.
+
+`devUrl` must be `http://localhost:<port>` or `http://127.0.0.1:<port>`, and not the phone's own address.
+
 ## Limits of v1 (planned next)
 
 - Folder install only (no `.fpapp` zip yet).
-- No hot-reload dev mode; reopen the app after editing.
 - Text files only through `phone.fs`.
 - No background running, notifications from apps, or app-to-app messaging.

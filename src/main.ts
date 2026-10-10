@@ -372,7 +372,7 @@ view.addEventListener("click", async (e) => {
 // ---- Apps: third-party web apps in Documents/FakePhone/Apps/<id>, run in a sandbox ----
 // See docs/APPS.md. Each app is an iframe with no network and no access to the phone;
 // it can only call the `phone` API below, and each call is permission-checked here.
-type Manifest = { id: string; name: string; version?: string; entry: string; icon?: string; permissions: string[] };
+type Manifest = { id: string; name: string; version?: string; entry: string; icon?: string; permissions: string[]; devUrl?: string };
 type Installed = Manifest & { img?: string };
 type P = Record<string, unknown>;
 
@@ -383,7 +383,7 @@ const PERMS: Record<string, string> = {
   "messages.send": "send messages from your number",
 };
 let installed: Installed[] = [];
-let running: { m: Manifest; frame: HTMLIFrameElement } | null = null;
+let running: { m: Manifest; frame: HTMLIFrameElement; hello: boolean; sig: string } | null = null;
 let grants = load<Record<string, Record<string, boolean>>>("grants", {});
 const warned = new Set<string>();
 
@@ -409,9 +409,18 @@ function parseManifest(folder: string, txt: string): Manifest | string {
   const entry = j.entry === undefined ? "index.html" : j.entry;
   if (typeof entry !== "string" || !okRel(entry)) return "entry isn't a valid path";
   if (j.icon !== undefined && (typeof j.icon !== "string" || !okRel(j.icon) || !IMG_EXT.has(extOf(j.icon)))) return "icon must be a png, jpg, gif, webp or svg in the app folder";
+  // Optional dev server for Developer mode: only plain localhost, and never the phone's own origin.
+  let devUrl: string | undefined;
+  if (j.devUrl !== undefined) {
+    try {
+      const u = new URL(String(j.devUrl));
+      if (u.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(u.hostname) || !u.port || u.origin === location.origin) throw new Error("bad");
+      devUrl = u.href;
+    } catch { return "devUrl must be http://localhost:<port> and can't be the phone's own address"; }
+  }
   const permissions = j.permissions === undefined ? [] : j.permissions;
   if (!Array.isArray(permissions) || permissions.some((p) => typeof p !== "string" || !(p in PERMS))) return `permissions can only be: ${Object.keys(PERMS).join(", ")}`;
-  return { id: j.id, name: j.name.trim(), version: typeof j.version === "string" ? j.version : undefined, entry, icon: j.icon as string | undefined, permissions: permissions as string[] };
+  return { id: j.id, name: j.name.trim(), version: typeof j.version === "string" ? j.version : undefined, entry, icon: j.icon as string | undefined, permissions: permissions as string[], devUrl };
 }
 
 const allApps = (): App[] => apps.concat(installed.map((m) => ({ id: "app:" + m.id, name: m.name, icon: "apps", img: m.img })));
@@ -496,6 +505,9 @@ async function inlineCss(base: string, rel: string, css: string) {
   return out + css.slice(last);
 }
 
+// A literal "</script" inside inlined code would end the <script> tag early.
+const inlineJs = (js: string) => js.replace(/<\/script/gi, "<\\/script");
+
 async function buildDoc(m: Manifest): Promise<string> {
   const base = `Apps/${m.id}`;
   const doc = new DOMParser().parseFromString(await readText(`${base}/${m.entry}`), "text/html");
@@ -510,7 +522,7 @@ async function buildDoc(m: Manifest): Promise<string> {
   for (const s of Array.from(doc.querySelectorAll<HTMLScriptElement>("script[src]"))) {
     const p = resolveIn(dir, s.getAttribute("src")!);
     if (!p) continue;
-    s.textContent = await readText(`${base}/${p}`);
+    s.textContent = inlineJs(await readText(`${base}/${p}`));
     s.removeAttribute("src");
   }
   for (const i of Array.from(doc.querySelectorAll<HTMLImageElement>("img[src]"))) {
@@ -522,23 +534,88 @@ async function buildDoc(m: Manifest): Promise<string> {
   csp.httpEquiv = "Content-Security-Policy";
   csp.content = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data:";
   const sdk = doc.createElement("script");
-  sdk.textContent = sdkSrc;
+  sdk.textContent = inlineJs(sdkSrc);
   doc.head.prepend(sdk);
   doc.head.prepend(csp);
   return "<!doctype html>" + doc.documentElement.outerHTML;
 }
 
+// ---- Developer mode: console, auto-reload, dev-server apps ----
+const devLogs: { lvl: string; text: string }[] = [];
+let devErrs = 0;
+let devOpen = false;
+const devOn = () => !!toggles["Developer mode"];
+function devLog(lvl: string, text: string) {
+  devLogs.push({ lvl, text: text.slice(0, 2000) });
+  if (devLogs.length > 300) devLogs.shift();
+  if (lvl === "error" && !devOpen) devErrs++;
+  drawDev();
+}
+function drawDev() {
+  const panel = document.getElementById("devlog");
+  const badge = document.getElementById("devcount");
+  const lines = document.getElementById("devlines");
+  if (panel) panel.hidden = !devOpen;
+  if (badge) { badge.hidden = !devErrs || devOpen; badge.textContent = String(devErrs); }
+  if (lines && devOpen) {
+    lines.innerHTML = devLogs.map((l) => `<div class="ll ${l.lvl}">${esc(l.text)}</div>`).join("");
+    lines.scrollTop = lines.scrollHeight;
+  }
+}
+// Signature of every file in an app folder, to notice edits.
+async function appSig(rel: string, depth = 0): Promise<string> {
+  const list = await invoke<[string, boolean, number, number][]>("fs_list", { rel }).catch(() => [] as [string, boolean, number, number][]);
+  let s = "";
+  for (const [n, d, size, ts] of list) s += d ? (depth < 4 ? `${n}/{${await appSig(`${rel}/${n}`, depth + 1)}}` : "") : `${n}:${size}:${ts};`;
+  return s;
+}
+let watching = false;
+setInterval(async () => {
+  const r = running;
+  if (!r || watching || !devOn() || !inTauri || r.m.devUrl || !r.sig) return;
+  watching = true;
+  try {
+    if ((await appSig(`Apps/${r.m.id}`)) !== r.sig && running === r) {
+      devLog("info", "Files changed, reloading");
+      await refreshApps();
+      if (running === r) await launchApp(r.m.id);
+    }
+  } finally { watching = false; }
+}, 1000);
+
 async function launchApp(id: string) {
   const frame = document.getElementById("appframe") as HTMLIFrameElement | null;
   const m = installed.find((x) => x.id === id);
   if (!frame || !m) return;
+  const dev = devOn();
   try {
-    const html = await buildDoc(m);
-    if (cur() !== "app:" + id) return; // user already left
-    running = { m, frame };
-    frame.srcdoc = html;
+    frame.removeAttribute("srcdoc");
+    if (dev && m.devUrl) {
+      // Loaded from your own dev server (its own origin, so it can't touch the phone).
+      // This isn't network-sandboxed: it's for development only.
+      const r = { m, frame, hello: false, sig: "" };
+      frame.setAttribute("sandbox", "allow-scripts allow-same-origin");
+      running = r;
+      frame.src = m.devUrl;
+      devLog("info", `Loading ${m.devUrl}`);
+      setTimeout(() => {
+        if (running === r && !r.hello) devLog("error", 'No phone SDK found. Add <script src="phone-sdk.js"></script> to your page (copy src/sdk/phone-sdk.js).');
+      }, 4000);
+    } else {
+      frame.setAttribute("sandbox", "allow-scripts");
+      const sig = dev ? await appSig(`Apps/${id}`) : "";
+      let html: string;
+      try { html = await buildDoc(m); } catch (e) {
+        if (m.devUrl && !dev) throw new Error("This app loads from a dev server. Turn on Developer mode in Settings.");
+        throw e;
+      }
+      if (cur() !== "app:" + id) return; // user already left
+      running = { m, frame, hello: false, sig };
+      frame.srcdoc = html;
+      if (dev) devLog("info", `Started ${m.name}`);
+    }
   } catch (e) {
-    $("#view").innerHTML = `<div class="page"><div class="title">${esc(m.name)}</div><p class="note">Couldn't start this app: ${esc(String(e))}</p></div>`;
+    $("#view").innerHTML = `<div class="page"><div class="title">${esc(m.name)}</div><p class="note">Couldn't start this app: ${esc(e instanceof Error ? e.message : String(e))}</p></div>`;
   }
 }
 
@@ -574,6 +651,7 @@ function dataPath(a: Manifest, v: unknown, allowEmpty = false) {
 }
 
 const API = new Map<string, { perm: string; run: (a: Manifest, p: P) => Promise<unknown> }>([
+  ["sdk.hello", { perm: "", run: async () => { if (running) running.hello = true; return null; } }],
   ["toast", { perm: "toast", run: async (a, p) => { toast(`${a.name}: ${str(p.text, "text").slice(0, 80)}`); return null; } }],
   ["fs.read", { perm: "storage", run: async (a, p) => {
     const buf = await readBuf(dataPath(a, p.path));
@@ -611,15 +689,31 @@ async function serve(r: NonNullable<typeof running>, d: { id: number; method: st
   const api = API.get(d.method);
   if (!api) return reply(false, `Unknown method “${d.method}”`);
   try {
-    if (!(await allowed(r.m, api.perm))) return reply(false, `Permission “${api.perm}” was denied`);
+    if (api.perm && !(await allowed(r.m, api.perm))) return reply(false, `Permission “${api.perm}” was denied`);
     const params = d.params && typeof d.params === "object" ? (d.params as P) : {};
     reply(true, await api.run(r.m, params));
   } catch (e) { reply(false, e instanceof Error ? e.message : String(e)); }
 }
+view.addEventListener("click", (e) => {
+  const el = (e.target as HTMLElement).closest<HTMLElement>("[data-dev]");
+  if (!el) return;
+  const a = el.dataset.dev;
+  if (a === "console") { devOpen = !devOpen; if (devOpen) devErrs = 0; drawDev(); }
+  else if (a === "clear") { devLogs.length = 0; devErrs = 0; drawDev(); }
+  else if (a === "reload" && running) {
+    const id = running.m.id;
+    devLog("info", "Reloading");
+    void refreshApps().then(() => launchApp(id));
+  }
+});
 window.addEventListener("message", (e) => {
   const d = e.data;
-  if (!running || e.source !== running.frame.contentWindow) return;
-  if (!d || d.fp !== 1 || typeof d.id !== "number" || typeof d.method !== "string") return;
+  if (!running || e.source !== running.frame.contentWindow || !d || d.fp !== 1) return;
+  if (typeof d.log === "string") {
+    if (devOn()) devLog(["log", "info", "warn", "error"].includes(d.log) ? d.log : "log", String(d.text ?? ""));
+    return;
+  }
+  if (typeof d.id !== "number" || typeof d.method !== "string") return;
   void serve(running, d);
 });
 
@@ -655,7 +749,7 @@ const byId = (id: string) => allApps().find((a) => a.id === id)!;
 const tile = (a: App) => `<button class="app" data-open="${a.id}"><span class="tile">${a.img ? `<img class="appimg" alt="" src="${a.img}" />` : icon(a.icon)}</span>${esc(a.name)}</button>`;
 
 const contacts = ["Alex Rivera", "Bree Walker", "Dad", "Jordan Lee", "Mum", "Sam Patel"];
-const toggles: Record<string, boolean> = { "Wi-Fi": true, Bluetooth: false, "Airplane mode": false, "Dark mode": false };
+const toggles: Record<string, boolean> = { "Wi-Fi": true, Bluetooth: false, "Airplane mode": false, "Dark mode": false, "Developer mode": load<boolean>("dev", false) };
 
 let stack: string[] = ["home"];
 const cur = () => stack[stack.length - 1];
@@ -669,7 +763,12 @@ function toast(msg: string) {
 
 function page(id: string): string {
   if (id.startsWith("app:"))
-    return `<div class="page app"><iframe id="appframe" sandbox="allow-scripts" title="${esc(byId(id)?.name ?? "App")}"></iframe></div>`;
+    return `<div class="page app"><iframe id="appframe" sandbox="allow-scripts" title="${esc(byId(id)?.name ?? "App")}"></iframe>${
+      devOn()
+        ? `<div class="devbar"><button class="chip" data-dev="reload" title="Reload app">↻</button><button class="chip" data-dev="console">Console <b class="badge static" id="devcount" hidden></b></button></div>
+           <div class="devlog" id="devlog" hidden><div class="devhead"><b>Console</b><button data-dev="clear">Clear</button><button data-dev="console">Close</button></div><div class="devlines" id="devlines"></div></div>`
+        : ""
+    }</div>`;
   if (id.startsWith("thread:"))
     return `<div class="page"><div class="title">${fmt(id.slice(7))}</div><div class="bubbles" id="bubbles"></div>
       <div class="compose"><input class="field" id="msg" placeholder="Text message" maxlength="1000" autocomplete="off" />
@@ -788,7 +887,7 @@ function show(id: string, push = true) {
   else if (id === "auth") $("#email").focus();
   else if (id === "files") void fsLoad();
   else if (id === "viewer") void openViewer();
-  else if (id.startsWith("app:")) void launchApp(id.slice(4));
+  else if (id.startsWith("app:")) { devLogs.length = 0; devErrs = 0; devOpen = false; drawDev(); void launchApp(id.slice(4)); }
   refreshBadge();
 }
 
@@ -834,6 +933,7 @@ view.addEventListener("click", (e) => {
     toggles[k] = !toggles[k];
     el.setAttribute("aria-checked", String(toggles[k]));
     if (k === "Dark mode") $("#screen").classList.toggle("dark", toggles[k]);
+    if (k === "Developer mode") save("dev", toggles[k]);
   } else if (el.dataset.key) {
     const dial = $("#dial");
     dial.textContent = el.dataset.key === "⌫" ? dial.textContent!.slice(0, -1) : (dial.textContent! + el.dataset.key).slice(0, 15);

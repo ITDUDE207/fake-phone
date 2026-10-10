@@ -19,3 +19,5 @@ on("list", async () => {
   return files.length ? files.map((f) => f.name).join(", ") : "No files yet";
 });
 on("send", async () => { await phone.messages.send($("to").value.replace(/\D/g, ""), "hi"); return "Message sent"; });
+
+console.log("Hello app ready");

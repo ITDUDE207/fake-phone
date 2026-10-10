@@ -2,6 +2,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createClient } from "@neondatabase/neon-js";
 import { invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { MAX_JSON, pack, publishProblems, sha256Hex, unpack } from "./appstore";
 import sdkSrc from "./sdk/phone-sdk.js?raw";
 import helloManifest from "../sample-apps/hello/manifest.json?raw";
 import helloHtml from "../sample-apps/hello/index.html?raw";
@@ -443,7 +444,7 @@ async function refreshApps() {
     const list = await invoke<[string, boolean, number, number][]>("fs_list", { rel: "Apps" });
     const next: Installed[] = [];
     for (const [folder, isDir] of list) {
-      if (!isDir) continue;
+      if (!isDir || folder.startsWith(".")) continue; // dot folders are half-finished installs
       try {
         const m = parseManifest(folder, await readText(`Apps/${folder}/manifest.json`));
         if (typeof m === "string") throw new Error(m);
@@ -717,9 +718,217 @@ window.addEventListener("message", (e) => {
   void serve(running, d);
 });
 
+// ---- App Store: users submit apps, an admin approves them, everyone can download ----
+// Apps are stored in Neon as one packed text bundle (see src/appstore.ts). Nothing that comes back
+// from the store is trusted: it is checked against its checksum, unpacked by `unpack` (names, types,
+// sizes), its manifest is re-validated, and its permissions must match its listing before any file is
+// written. Installed apps then run in the same sandbox as any other app.
+type Listing = { id: number; slug: string; name: string; description: string; version: string; permissions: string[]; author_number: string; sha256: string; status: string };
+type Tab = "browse" | "mine" | "review";
+const STORE_COLS = "id, slug, name, description, version, permissions, author_number, sha256, status";
+let storeTab: Tab = "browse";
+let storeRows: Listing[] = [];
+let storeAdmin = false;
+let storeAdminFor = "";
+let storeBusy = false;
+const storeInstalls = load<Record<string, { id: number; sha: string }>>("storeInstalls", {});
+const dec = new TextDecoder();
+const storeErr = (e: unknown) => (e instanceof Error ? e.message : typeof e === "string" ? e : "Something went wrong");
+
+function drawStoreTabs() {
+  const el = document.getElementById("storetabs");
+  if (!el) return;
+  const tabs: [Tab, string][] = [["browse", "Browse"], ["mine", "My apps"]];
+  if (storeAdmin) tabs.push(["review", "Review"]);
+  el.innerHTML =
+    tabs.map(([t, l]) => `<button class="tab ${t === storeTab ? "on" : ""}" data-st="tab" data-tab="${t}">${l}</button>`).join("") +
+    '<button class="tab pub" data-st="publish">+ Publish</button>';
+}
+
+function storeCard(r: Listing, i: number) {
+  const inst = storeInstalls[r.slug];
+  const b = (a: string, label: string, cls = "") => `<button class="btn sm ${cls}" data-st="${a}" data-i="${i}">${label}</button>`;
+  const btns =
+    storeTab === "browse" ? [inst?.id === r.id ? b("remove", "Remove", "ghost") : b("get", inst ? "Update" : "Get")]
+    : storeTab === "mine" ? [b("del", "Delete", "danger")]
+    : [b("get", "Try it", "ghost"), b("approve", "Approve"), b("reject", "Reject", "danger")];
+  const perms = r.permissions.length ? r.permissions.map((p) => `<span class="perm">${esc(PERMS[p] ?? p)}</span>`).join("") : '<span class="perm">needs no permissions</span>';
+  return `<div class="card appcard"><div class="head"><b class="nm">${esc(r.name)}</b><small>${r.version ? "v" + esc(r.version) : ""}</small></div>
+    <small>by ${esc(fmt(r.author_number))}${storeTab === "browse" ? "" : ` <span class="stat ${esc(r.status)}">${esc(r.status)}</span>`}</small>
+    ${r.description ? `<p class="note">${esc(r.description)}</p>` : ""}
+    <div class="perms">${perms}</div><div class="btns2">${btns.join("")}</div></div>`;
+}
+
+function drawStore() {
+  const box = document.getElementById("storelist");
+  if (!box) return;
+  const empty = { browse: "No apps yet. Be the first to publish one.", mine: "You haven't published anything yet.", review: "Nothing is waiting for review." }[storeTab];
+  box.innerHTML = storeRows.length ? storeRows.map(storeCard).join("") : `<p class="empty">${empty}</p>`;
+}
+
+async function loadStore() {
+  const box = document.getElementById("storelist");
+  if (!box || !client || !user) return;
+  if (storeAdminFor !== user.id) {
+    storeAdmin = await client.rpc("is_admin").then((r) => r.data === true, () => false);
+    storeAdminFor = user.id;
+  }
+  if (storeTab === "review" && !storeAdmin) storeTab = "browse";
+  drawStoreTabs();
+  box.innerHTML = '<p class="empty">Loading…</p>';
+  let q = client.from("store_apps").select(STORE_COLS);
+  q = storeTab === "browse" ? q.eq("status", "approved") : storeTab === "mine" ? q.eq("author_id", user.id) : q.eq("status", "pending");
+  const r = await q.order("created_at", { ascending: false }).limit(100);
+  if (!document.getElementById("storelist")) return; // user left
+  if (r.error) { box.innerHTML = `<p class="empty">${esc(r.error.message)}</p>`; return; }
+  let rows = r.data as unknown as Listing[];
+  if (storeTab === "browse") { // newest approved version of each app
+    const seen = new Set<string>();
+    rows = rows.filter((x) => !seen.has(x.slug) && !!seen.add(x.slug));
+  }
+  storeRows = rows;
+  drawStore();
+}
+
+async function storeInstall(r: Listing) {
+  if (!inTauri) throw new Error("Installing apps needs the desktop app");
+  toast(`Downloading ${r.name}…`);
+  const res = await client!.from("store_apps").select("bundle, sha256").eq("id", r.id).single();
+  if (res.error) throw new Error(res.error.message);
+  const { bundle, sha256 } = res.data as { bundle: string; sha256: string };
+  if (sha256 !== r.sha256 || (await sha256Hex(bundle)) !== sha256) throw new Error("Download didn't match its checksum");
+  const files = unpack(bundle);
+  const m = parseManifest(r.slug, dec.decode(files.get("manifest.json")!));
+  if (typeof m === "string") throw new Error(`This app is broken: ${m}`);
+  if (m.devUrl) throw new Error("Store apps can't load from a dev server");
+  if (!files.has(m.entry)) throw new Error("This app is missing its entry file");
+  if ([...m.permissions].sort().join() !== [...r.permissions].sort().join()) throw new Error("This app's permissions don't match its listing");
+
+  const folder = `Apps/${r.slug}`;
+  const exists = await invoke("fs_list", { rel: folder }).then(() => true, () => false);
+  if (exists && !storeInstalls[r.slug]) throw new Error(`You already have your own app called “${r.slug}”. Rename or remove it first.`);
+  const tmp = `Apps/.install-${r.slug}`;
+  await invoke("fs_delete", { rel: tmp }).catch(() => undefined);
+  for (const [p, data] of files) await invoke("fs_write", data, { headers: { "x-path": encodeURIComponent(`${tmp}/${p}`) } });
+  if (exists) await invoke("fs_delete", { rel: folder });
+  await invoke("fs_rename", { from: tmp, to: folder });
+
+  // An update that asks for something new must ask the user again.
+  const prev = installed.find((i) => i.id === r.slug)?.permissions ?? [];
+  if (m.permissions.some((p) => !prev.includes(p))) { delete grants[r.slug]; save("grants", grants); }
+  storeInstalls[r.slug] = { id: r.id, sha: sha256 };
+  save("storeInstalls", storeInstalls);
+  await refreshApps();
+  drawStore();
+  toast(`${r.name} installed. Find it in the app drawer`);
+}
+
+async function storeRemove(slug: string) {
+  await invoke("fs_delete", { rel: `Apps/${slug}` });
+  delete storeInstalls[slug];
+  save("storeInstalls", storeInstalls);
+  await refreshApps();
+  drawStore();
+  toast("Removed. Its saved data is still in AppData");
+}
+
+async function walkApp(rel: string, prefix: string, out: { path: string; size: number }[], problems: string[], depth = 0) {
+  const list = await invoke<[string, boolean, number, number][]>("fs_list", { rel });
+  for (const [name, isDir, size] of list) {
+    const p = prefix ? `${prefix}/${name}` : name;
+    if (!isDir) out.push({ path: p, size });
+    else if (name === "node_modules" || name.startsWith(".")) problems.push(`Remove the folder ${p}`);
+    else if (depth >= 4) problems.push(`${p} is nested too deeply`);
+    else await walkApp(`${rel}/${name}`, p, out, problems, depth + 1);
+  }
+}
+
+async function storePublish() {
+  if (!inTauri) throw new Error("Publishing needs the desktop app");
+  await refreshApps();
+  if (!installed.length) throw new Error("Make an app first: see docs/APPS.md");
+  const pick = await popup(`<div class="title sm">Publish which app?</div><div class="stack">${installed
+    .map((a) => `<button class="btn wide ghost" data-d="app:${esc(a.id)}">${esc(a.name)}</button>`).join("")}
+    <button class="btn wide ghost" data-d="no">Cancel</button></div>`);
+  const m = pick.id.startsWith("app:") ? installed.find((a) => a.id === pick.id.slice(4)) : undefined;
+  if (!m) return;
+  if (storeInstalls[m.id]) throw new Error("That app came from the store: you can't publish it as your own");
+  const d = await popup(`<div class="title sm">Publish “${esc(m.name)}”</div><p class="note">Describe it in a sentence (optional). An admin reviews it before it appears in the store.</p>
+    <input class="field" maxlength="300" autocomplete="off" placeholder="What does it do?" />
+    <div class="stack"><button class="btn wide" data-d="ok">Submit</button><button class="btn wide ghost" data-d="no">Cancel</button></div>`);
+  if (d.id !== "ok") return;
+
+  toast("Checking your app…");
+  const base = `Apps/${m.id}`;
+  const found: { path: string; size: number }[] = [];
+  const problems: string[] = [];
+  await walkApp(base, "", found, problems);
+  problems.push(...publishProblems(found));
+  if (!found.some((f) => f.path === m.entry)) problems.push(`Entry file ${m.entry} is missing (apps that only run from a dev server can't be published)`);
+  if (problems.length) {
+    await popup(`<div class="title sm">Fix these first</div><div class="note">${problems.slice(0, 8).map((p) => `• ${esc(p)}`).join("<br />")}</div>
+      <div class="stack"><button class="btn wide" data-d="no">OK</button></div>`);
+    return;
+  }
+  const files = new Map<string, Uint8Array>();
+  for (const f of found) files.set(f.path, new Uint8Array(await readBuf(`${base}/${f.path}`)));
+  const manifest = JSON.parse(dec.decode(files.get("manifest.json")!)) as Record<string, unknown>;
+  delete manifest.devUrl; // a published app always runs from its own files
+  files.set("manifest.json", new TextEncoder().encode(JSON.stringify(manifest, null, 2)));
+  const json = pack(files);
+  if (json.length > MAX_JSON) throw new Error("That app is too big to publish");
+  const ins = await client!.from("store_apps").insert({
+    slug: m.id, name: m.name, description: d.val, version: (m.version ?? "").slice(0, 20),
+    permissions: m.permissions, author_number: myNum, bundle: json, sha256: await sha256Hex(json),
+  });
+  if (ins.error) throw new Error(ins.error.code === "42501" ? "That app id already belongs to another author" : ins.error.message);
+  toast("Submitted. It will appear once an admin approves it");
+  storeTab = "mine";
+  void loadStore();
+}
+
+async function storeAct(a: string, r: Listing) {
+  if (a === "get") await storeInstall(r);
+  else if (a === "remove") await storeRemove(r.slug);
+  else if (a === "approve" || a === "reject") {
+    const u = await client!.from("store_apps").update({ status: a === "approve" ? "approved" : "rejected" }).eq("id", r.id).select("id");
+    if (u.error) throw new Error(u.error.message);
+    if (!u.data?.length) throw new Error("Only admins can review apps");
+    toast(a === "approve" ? "Approved" : "Rejected");
+    await loadStore();
+  } else if (a === "del") {
+    const c = await popup(`<div class="title sm">Delete “${esc(r.name)}”?</div><p class="note">It will be removed from the store. People who already installed it keep their copy.</p>
+      <div class="stack"><button class="btn wide danger" data-d="ok">Delete</button><button class="btn wide ghost" data-d="no">Cancel</button></div>`);
+    if (c.id !== "ok") return;
+    const x = await client!.from("store_apps").delete().eq("id", r.id).select("id");
+    if (x.error) throw new Error(x.error.message);
+    await loadStore();
+  }
+}
+
+view.addEventListener("click", async (e) => {
+  const el = (e.target as HTMLElement).closest<HTMLElement>("[data-st]");
+  if (!el) return;
+  const a = el.dataset.st ?? "";
+  if (a === "tab") {
+    if (el.dataset.tab === "browse" || el.dataset.tab === "mine" || el.dataset.tab === "review") { storeTab = el.dataset.tab; void loadStore(); }
+    return;
+  }
+  if (storeBusy) return;
+  storeBusy = true;
+  try {
+    if (a === "publish") await storePublish();
+    else {
+      const r = storeRows[Number(el.dataset.i)];
+      if (r) await storeAct(a, r);
+    }
+  } catch (err) { toast(storeErr(err)); } finally { storeBusy = false; }
+});
+
 // ---- UI ----
 const paths: Record<string, string> = {
   folder: '<path d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  store: '<path d="M5 8h14l-1 13H6z"/><path d="M9 8V6.5a3 3 0 0 1 6 0V8h-1.8V6.5a1.2 1.2 0 0 0-2.4 0V8z"/>',
   file: '<path d="M6 2h8l5 5v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm7 1.5V8h4.5z"/>',
   chat: '<path d="M4 3h16a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 1-2z"/>',
   phone: '<path d="M6.6 10.8a15 15 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25c1.1.37 2.3.57 3.6.57a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1z"/>',
@@ -744,6 +953,7 @@ const apps: App[] = [
   { id: "notes", name: "Notes", icon: "notes" },
   { id: "games", name: "Games", icon: "games" },
   { id: "files", name: "Files", icon: "folder" },
+  { id: "store", name: "App Store", icon: "store" },
 ];
 const byId = (id: string) => allApps().find((a) => a.id === id)!;
 const tile = (a: App) => `<button class="app" data-open="${a.id}"><span class="tile">${a.img ? `<img class="appimg" alt="" src="${a.img}" />` : icon(a.icon)}</span>${esc(a.name)}</button>`;
@@ -774,6 +984,9 @@ function page(id: string): string {
       <div class="compose"><input class="field" id="msg" placeholder="Text message" maxlength="1000" autocomplete="off" />
       <button class="btn" data-act="send">Send</button></div></div>`;
   switch (id) {
+    case "store":
+      return `<div class="page"><div class="head"><div class="title">App Store</div></div>
+        <div class="tabs" id="storetabs"></div><div class="storelist" id="storelist"></div></div>`;
     case "files":
       return `<div class="page"><div class="head"><div class="title">Files</div><button class="btn sm ghost" data-fs="here">Show on PC</button></div>
         <div class="crumbs" id="fscrumbs"></div>
@@ -830,6 +1043,7 @@ function page(id: string): string {
         .join("")}</div>
         <div class="card"><div class="row"><span class="grow">Your number<small>${fmt(myNum)}</small></span></div>
         <div class="row"><span class="grow">App permissions<small>Forget what apps are allowed</small></span><button class="btn sm ghost" data-act="resetgrants">Reset</button></div>
+        <div class="row"><span class="grow">Account ID<small class="mono">${esc(user?.id ?? "")}</small></span></div>
         <div class="row"><span class="grow">Account<small>${esc(user?.email ?? "")}</small></span><button class="btn sm" data-act="signout">Sign out</button></div></div></div></div>`;
     case "phone":
       return `<div class="page"><div class="dial" id="dial"></div><div class="pad">${[..."123456789*0#"]
@@ -886,6 +1100,7 @@ function show(id: string, push = true) {
   } else if (id === "new") $("#num").focus();
   else if (id === "auth") $("#email").focus();
   else if (id === "files") void fsLoad();
+  else if (id === "store") void loadStore();
   else if (id === "viewer") void openViewer();
   else if (id.startsWith("app:")) { devLogs.length = 0; devErrs = 0; devOpen = false; drawDev(); void launchApp(id.slice(4)); }
   refreshBadge();

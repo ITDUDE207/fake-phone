@@ -174,3 +174,21 @@ input { user-select: text; }
 .ll.warn { color: #ffd479; }
 .ll.error { color: #ff8a8a; }
 .ll.info { color: #8cc4ff; }
+
+/* app store */
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+.tab { padding: 5px 12px; border-radius: 999px; background: var(--glass); font-size: 12px; font-weight: 600; }
+.tab.on { background: var(--accent); color: #fff; }
+.tab.pub { margin-left: auto; background: #1d2233; color: #fff; }
+.storelist { flex: 1; min-height: 0; overflow: auto; }
+.storelist::-webkit-scrollbar { display: none; }
+.appcard { margin-bottom: 10px; padding: 10px 12px; text-align: left; }
+.appcard .head { justify-content: flex-start; gap: 8px; align-items: baseline; }
+.perms { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 8px; }
+.perm { padding: 2px 8px; border-radius: 999px; background: rgba(90, 106, 184, 0.16); font-size: 10px; }
+.btns2 { display: flex; justify-content: flex-end; gap: 6px; }
+.stat { padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 600; }
+.stat.pending { background: #ffe9b5; }
+.stat.approved { background: #c9f2d9; }
+.stat.rejected { background: #ffd0d3; }
+.mono { font-family: Consolas, monospace; word-break: break-all; user-select: text; }

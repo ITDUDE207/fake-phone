@@ -98,3 +98,28 @@ sandbox, which is how your users will run the app, so test that before you ship.
 - Folder install only (no `.fpapp` zip yet).
 - Text files only through `phone.fs`.
 - No background running, notifications from apps, or app-to-app messaging.
+
+## The App Store
+
+Open **App Store** in the drawer (you need to be signed in). **Browse** lists approved apps; **Get** installs
+one into `Apps/<id>/` and it appears in the drawer. **Update** appears when a newer approved version exists,
+and **Remove** deletes the app (its saved data stays in `AppData/<id>/`).
+
+### Publishing your app
+
+1. Build and test your app in `Apps/<id>/` (Developer mode helps).
+2. App Store → **+ Publish**, pick the app, add a one-line description.
+3. It's checked on your phone first. Allowed: html, js, css, json, txt, md, svg, png, jpg, gif, webp, woff, woff2, ttf;
+   at most 60 files and 1 MB in total; no dot-files or `node_modules`; entry file must exist.
+   `devUrl` is removed automatically: a published app always runs from its own files.
+4. It shows as **pending** under *My apps* until an admin approves it. To ship a new version, publish again
+   from the same app id. An app id belongs to whoever submitted it first.
+
+What people see before installing: your phone number, the description, and exactly which permissions the app
+declares. Permissions are still asked at runtime, and every store app runs in the same sandbox as any other app.
+
+### Reviewing (admins)
+
+Admins get a **Review** tab. **Try it** installs a pending app on your phone so you can use it, and you can open
+its folder with Files → *Show on PC* to read the code. Then **Approve** or **Reject**. Read the code: the sandbox is
+the safety net, not the first line of defence.

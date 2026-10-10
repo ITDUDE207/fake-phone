@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>fake-phone</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div class="phone" id="phone" data-tauri-drag-region>
+      <button class="power" id="power" title="Power off" aria-label="Power off"></button>
+      <div class="screen" id="screen">
+        <header class="status" data-tauri-drag-region>
+          <span id="carrier" data-tauri-drag-region>No modem</span>
+          <span class="notch" data-tauri-drag-region></span>
+          <span id="status-time" data-tauri-drag-region>00:00</span>
+        </header>
+        <main class="view" id="view"></main>
+        <nav class="nav">
+          <button data-nav="recents" aria-label="Recent apps"><i class="sq"></i></button>
+          <button data-nav="home" aria-label="Home"><i class="pill"></i></button>
+          <button data-nav="back" aria-label="Back"><i class="back"></i></button>
+        </nav>
+        <div class="toast" id="toast"></div>
+      </div>
+    </div>
+  </body>
+</html>

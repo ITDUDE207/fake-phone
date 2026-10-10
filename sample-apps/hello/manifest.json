@@ -1,0 +1,8 @@
+{
+  "id": "hello",
+  "name": "Hello",
+  "version": "1.0.0",
+  "entry": "index.html",
+  "icon": "icon.svg",
+  "permissions": ["toast", "storage", "identity", "messages.send"]
+}

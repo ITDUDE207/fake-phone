@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hello</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <h1>Hello, phone!</h1>
+    <p class="lead">A sample app. Each button asks the phone for a different permission.</p>
+
+    <button id="toast">Show a toast</button>
+    <button id="number">My number</button>
+
+    <textarea id="note" placeholder="Write a note, then Save"></textarea>
+    <div class="row">
+      <button id="save">Save</button>
+      <button id="load">Load</button>
+      <button id="list">List files</button>
+    </div>
+
+    <div class="row">
+      <input id="to" inputmode="numeric" placeholder="Number to text" />
+      <button id="send">Send “hi”</button>
+    </div>
+
+    <div id="out" aria-live="polite"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
